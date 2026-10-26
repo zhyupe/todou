@@ -7,17 +7,17 @@
  *   node scripts/codex-follow-smoke.mjs --cli result/bin/todou  # a built CLI
  *   node scripts/codex-follow-smoke.mjs --mutate queue   # must fail
  *   node scripts/codex-follow-smoke.mjs --mutate busy   # must fail
+ *   node scripts/codex-follow-smoke.mjs --idle-unload-check
+ *   node scripts/codex-follow-smoke.mjs --idle-unload-check --mutate subscription # must fail
  *
- * Three checks, each against what the model is actually sent:
- *   queue  — no control socket: a comment on the card reaches the idle thread
- *            through `codex queue` as a new turn;
- *   busy   — even with an App socket present, another card's comment waits
- *            for the active turn to finish and survives the watcher exiting;
- *   range  — the second batch's `since:` is the first batch's `cursor:`.
+ * Detaches the observer before testing delivery, preserves cursor ranges,
+ * combines changes across busy debounce windows, and checks shutdown recovery.
+ * --idle-unload-check waits for an unsubscribed control thread to unload before
+ * posting the first change, using the tested daemon's actual grace period.
  *
- * `--mutate` breaks one input on purpose so the check guarding it can be seen
- * to fail: `queue` hands the watch a `codex` that confirms nothing, `busy`
- * lets the running turn finish before the comment is posted.
+ * Mutations must fail: queue removes the admission receipt; busy falsifies the
+ * watcher's status reads; subscription replaces its resume with a read. Use
+ * --idle-unload-check with the subscription mutation to exercise idle unloading.
  *
  * The smoke posts as the account the watch runs as, so the watch takes
  * --any-actor; the self-filter is not what this checks.
@@ -25,7 +25,7 @@
  * Needs no model login: the app-server talks to a local Responses API stub.
  * Sockets and CODEX_HOME live under os.tmpdir() because a Unix socket path
  * must fit in 108 bytes; everything else goes to a scratch dir under .tmp/.
- * Both are removed on exit unless --keep.
+ * Socket directories are removed on exit; --keep retains the scratch logs.
  */
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
@@ -51,15 +51,21 @@ const cliEntry = join(root, "projects/cli/src/index.ts");
 const serverEntry = join(root, "projects/server/src/index.ts");
 const WebSocket = createRequire(join(root, "projects/cli/package.json"))("ws");
 
-const options = { "codex-bin": "codex", cli: "", mutate: "", keep: false };
+const options = {
+  "codex-bin": "codex",
+  cli: "",
+  mutate: "",
+  keep: false,
+  "idle-unload-check": false,
+};
 for (let i = 2; i < process.argv.length; i++) {
   const key = process.argv[i].replace(/^--/, "");
-  if (key === "keep") options.keep = true;
+  if (key === "keep" || key === "idle-unload-check") options[key] = true;
   else if (key in options) options[key] = process.argv[++i];
   else throw new Error(`unknown option ${process.argv[i]}`);
 }
-if (!["", "queue", "busy"].includes(options.mutate)) {
-  throw new Error("--mutate takes queue or busy");
+if (!["", "queue", "busy", "subscription"].includes(options.mutate)) {
+  throw new Error("--mutate takes queue, busy, or subscription");
 }
 
 mkdirSync(join(root, ".tmp"), { recursive: true });
@@ -297,7 +303,7 @@ const codexBin = execFileSync(
 say(
   `codex: ${execFileSync(codexBin, ["--version"], { encoding: "utf8" }).trim()} at ${codexBin}`,
 );
-// Observe actual queue admission before stopping the watcher in the busy case.
+// Observe admission independently of the watcher and model.
 const queueLog = join(scratch, "queued.jsonl");
 writeFileSync(queueLog, "");
 const queueBin = join(short, "codex-queue-observed");
@@ -310,7 +316,7 @@ const args = process.argv.slice(2);
 const result = spawnSync(${JSON.stringify(codexBin)}, args, { encoding: 'utf8' });
 if (result.status === 0 && result.stdout.startsWith('Queued message '))
   appendFileSync(${JSON.stringify(queueLog)}, JSON.stringify(args) + '\\n');
-process.stdout.write(result.stdout || '');
+process.stdout.write(${JSON.stringify(options.mutate === "queue")} ? '' : result.stdout || '');
 process.stderr.write(result.stderr || '');
 process.exit(result.status ?? 1);
 `,
@@ -343,6 +349,52 @@ await until(
   },
   30_000,
 );
+
+// Only the watch uses this proxy; the observer always sees the real state.
+let watchSocket = appSocket;
+if (options.mutate === "busy" || options.mutate === "subscription") {
+  watchSocket = join(short, "mutated.sock");
+  const proxy = createServer();
+  const peers = new WebSocket.WebSocketServer({ server: proxy });
+  peers.on("connection", (client) => {
+    const upstream = new WebSocket("ws://localhost/", {
+      createConnection: () => connect(appSocket),
+      perMessageDeflate: false,
+    });
+    const backlog = [];
+    client.on("message", (data) => {
+      const message = JSON.parse(String(data));
+      if (
+        options.mutate === "subscription" &&
+        message.method === "thread/resume"
+      ) {
+        message.method = "thread/read";
+        message.params = { threadId: message.params.threadId };
+      }
+      const encoded = JSON.stringify(message);
+      if (upstream.readyState === WebSocket.OPEN) upstream.send(encoded);
+      else backlog.push(encoded);
+    });
+    upstream.on("open", () => {
+      for (const message of backlog.splice(0)) upstream.send(message);
+    });
+    upstream.on("message", (data) => {
+      const message = JSON.parse(String(data));
+      if (
+        options.mutate === "busy" &&
+        message.result?.thread?.status?.type === "active"
+      )
+        message.result.thread.status = { type: "idle" };
+      if (client.readyState === WebSocket.OPEN)
+        client.send(JSON.stringify(message));
+    });
+    client.on("close", () => upstream.terminate());
+    client.on("error", () => upstream.terminate());
+    upstream.on("close", () => client.terminate());
+    upstream.on("error", () => client.terminate());
+  });
+  await new Promise((resolve) => proxy.listen(watchSocket, resolve));
+}
 
 const app = new WebSocket("ws://localhost/", {
   createConnection: () => connect(appSocket),
@@ -379,7 +431,10 @@ const rpc = (method, params) =>
     assert.ok(!m.error, `${method}: ${JSON.stringify(m.error)}`);
     return m.result;
   });
-await rpc("initialize", { clientInfo: { name: "smoke-app", version: "0" } });
+await rpc("initialize", {
+  clientInfo: { name: "smoke-app", version: "0" },
+  capabilities: { experimentalApi: true },
+});
 app.send(JSON.stringify({ method: "initialized" }));
 
 async function thread() {
@@ -394,8 +449,6 @@ async function thread() {
 }
 const completed = (id) =>
   turns.filter((t) => t.thread === id && t.event === "turn/completed").length;
-const started = (id) =>
-  turns.filter((t) => t.thread === id && t.event === "turn/started").length;
 
 function watch(threadId, extra) {
   return start(
@@ -408,7 +461,7 @@ function watch(threadId, extra) {
       "smoke",
       "--follow=codex",
       "--debounce",
-      "0",
+      "1",
       "--interval",
       "1",
       "--any-actor",
@@ -423,6 +476,7 @@ function watch(threadId, extra) {
       CODEX_HOME: codexHome,
       CODEX_THREAD_ID: threadId,
       TODOU_CODEX_BIN: queueBin,
+      TODOU_CODEX_SOCKET: watchSocket,
       ...extra,
     },
   );
@@ -439,155 +493,178 @@ async function check(name, body) {
   }
 }
 
-// queue + range
+const idle = async (id) =>
+  (await rpc("thread/read", { threadId: id })).thread.status.type === "idle";
 const queued = await thread();
-let queueEnv = {};
-if (options.mutate === "queue") {
-  const fake = join(short, "codex-silent");
-  writeFileSync(fake, "#!/bin/sh\nexit 0\n");
-  chmodSync(fake, 0o755);
-  queueEnv = { TODOU_CODEX_BIN: fake };
-}
-const queueWatch = watch(queued, queueEnv);
-await check("watch opens over codex queue", () =>
-  until(
-    "the via line",
-    () => queueWatch.output.stderr.includes("via codex queue"),
-    30_000,
-  ),
+const queueWatch = watch(queued, {});
+await until(
+  "the watch subscription",
+  () => queueWatch.output.stderr.includes("coalescing changes until idle"),
+  30000,
 );
+await rpc("thread/unsubscribe", { threadId: queued });
+
+if (options["idle-unload-check"]) {
+  const control = await thread();
+  await rpc("thread/unsubscribe", { threadId: control });
+  const since = Date.now();
+  say(
+    "Waiting for an unsubscribed control thread to unload; observer reads do not subscribe",
+  );
+  while (true) {
+    await sleep(10_000);
+    assert.equal(
+      queueWatch.exitCode,
+      null,
+      `watch stopped during idle interval: ${queueWatch.output.stderr}`,
+    );
+    assert.equal(
+      queueWatch.signalCode,
+      null,
+      "watch terminated during idle interval",
+    );
+    const status = (await rpc("thread/read", { threadId: control })).thread
+      .status.type;
+    if (status === "notLoaded") break;
+    assert.ok(
+      Date.now() - since < 31 * 60_000,
+      "control thread did not unload within 31 minutes",
+    );
+  }
+  assert.equal(
+    await idle(queued),
+    true,
+    "watcher's thread must remain loaded after the control unloads",
+  );
+  say(
+    `Control unloaded after ${Math.round((Date.now() - since) / 1000)} seconds; watcher still subscribed`,
+  );
+}
 const first = `SMOKE-QUEUE-${randomUUID()}`;
 await comment(first);
 await check(
-  "queue: the comment reaches the idle thread as a new turn",
+  "sole watcher subscription starts and completes a queued turn",
   async () => {
-    await until(
-      "the model to see the first comment",
-      () => requestWith(first),
-      45_000,
-    );
-    await until(
-      "a second turn on the thread",
-      () => completed(queued) >= 2,
-      30_000,
-    );
+    await until("the queued model request", () => requestWith(first), 45000);
+    await until("the queued turn to finish", () => idle(queued), 30000);
   },
 );
 const second = `SMOKE-RANGE-${randomUUID()}`;
 await comment(second);
-await check(
-  "range: the second batch starts where the first ended",
-  async () => {
-    const a = await until("the first batch", () => requestWith(first), 1_000);
-    const b = await until(
-      "the second batch",
-      () => requestWith(second),
-      45_000,
-    );
-    const cursor = /cursor: ([^\\\s]+)/.exec(
-      JSON.parse(a).content?.[0]?.text ?? a,
-    )?.[1];
-    const since = /since: ([^\\\s]+)/.exec(
-      JSON.parse(b).content?.[0]?.text ?? b,
-    )?.[1];
-    assert.ok(cursor, "first batch carries a cursor");
-    assert.equal(since, cursor);
-  },
-);
+await check("successive batches preserve the cursor range", async () => {
+  const a = await until("first batch", () => requestWith(first), 1000);
+  const b = await until("second batch", () => requestWith(second), 45000);
+  const cursor = /cursor: ([^\\\s]+)/.exec(
+    JSON.parse(a).content?.[0]?.text ?? a,
+  )?.[1];
+  const since = /since: ([^\\\s]+)/.exec(
+    JSON.parse(b).content?.[0]?.text ?? b,
+  )?.[1];
+  assert.ok(cursor);
+  assert.equal(since, cursor);
+  await until("second completion", () => idle(queued), 30000);
+});
 queueWatch.kill("SIGTERM");
+await until(
+  "first watcher exit",
+  () => queueWatch.exitCode !== null || queueWatch.signalCode !== null,
+  10000,
+);
 
-// An App-connected thread busy on one card must process another card later.
 const busy = await thread();
 const other = (
   await api(
     "/api/projects/smoke/issues",
-    {
-      method: "POST",
-      body: JSON.stringify({ title: "another card needs revision" }),
-    },
+    { method: "POST", body: JSON.stringify({ title: "another card" }) },
     bearer,
   )
 ).json;
-const busyWatch = watch(busy, { TODOU_CODEX_SOCKET: appSocket });
-await check("App watch also opens over codex queue", () =>
-  until(
-    "the via line",
-    () => busyWatch.output.stderr.includes("via codex queue"),
-    30_000,
-  ),
+const busyWatch = watch(busy, {});
+await until(
+  "busy watch subscription",
+  () => busyWatch.output.stderr.includes("coalescing changes until idle"),
+  30000,
 );
 slowGate = new Promise((r) => {
   releaseSlow = r;
 });
-const current = await rpc("turn/start", {
+await rpc("turn/start", {
   threadId: busy,
-  input: [{ type: "text", text: "SLOW work on the first card" }],
+  input: [{ type: "text", text: "SLOW work" }],
 });
-await until(
-  "the slow request to reach the model",
-  () => requestWith("SLOW"),
-  10_000,
-);
-if (options.mutate === "busy") {
-  releaseSlow();
-  await until("the slow turn to end", () => completed(busy) >= 2, 10_000);
-}
-const third = `SMOKE-BUSY-${randomUUID()}`;
-await comment(third, other.number);
+await until("slow request", () => requestWith("SLOW work"), 10000);
+await rpc("thread/unsubscribe", { threadId: busy });
+const markers = Array.from({ length: 3 }, () => `SMOKE-BUSY-${randomUUID()}`);
 await check(
-  "busy: another card waits, then starts a new turn after watch exit",
+  "busy thread collects across debounce windows without queueing",
   async () => {
-    await until(
-      "the batch to be durably queued",
-      () => admitted(third),
-      30_000,
-    );
-    // Exercise at least one queue polling interval while the turn is held.
-    await sleep(12_000);
-    assert.equal(completed(busy), 1, "the original turn must still be busy");
-    assert.equal(
-      started(busy),
-      2,
-      "the batch must not start a concurrent turn",
-    );
-    assert.equal(
-      requestWith(third),
-      undefined,
-      "the batch must not steer current work",
-    );
-    busyWatch.kill("SIGTERM");
-    await until(
-      "the watcher to stop",
-      () => busyWatch.exitCode !== null || busyWatch.signalCode !== null,
-      10_000,
-    );
-    releaseSlow();
-    await until(
-      "the queued batch to finish",
-      () => completed(busy) >= 3,
-      45_000,
-    );
-    assert.ok(
-      requestWith(third),
-      "the model receives the other card after watch exit",
-    );
-    const lifecycle = turns.filter((t) => t.thread === busy);
-    const finished = lifecycle.findIndex(
-      (t) => t.event === "turn/completed" && t.turn === current.turn.id,
-    );
-    assert.ok(finished >= 0);
-    assert.equal(lifecycle[finished + 1]?.event, "turn/started");
-    assert.notEqual(lifecycle[finished + 1]?.turn, current.turn.id);
-    assert.equal(
-      started(busy),
-      3,
-      "exactly one new turn handles the queued batch",
-    );
+    for (let i = 0; i < markers.length; i++) {
+      await comment(markers[i], i % 2 ? other.number : undefined);
+      await sleep(1500);
+      assert.equal(
+        admitted(markers[i]),
+        false,
+        "a busy thread must not receive a queued batch",
+      );
+      assert.equal(requestWith(markers[i]), undefined);
+    }
   },
 );
 releaseSlow();
+await check("one idle batch includes every card and event", async () => {
+  const request = await until(
+    "combined model request",
+    () => requestWith(markers[0]),
+    45000,
+  );
+  for (const marker of markers) assert.ok(request.includes(marker));
+  const batches = readFileSync(queueLog, "utf8")
+    .trim()
+    .split("\n")
+    .filter((line) => line.includes(markers[0]));
+  assert.equal(batches.length, 1);
+  for (const marker of markers) assert.ok(batches[0].includes(marker));
+  await until("combined turn completion", () => idle(busy), 30000);
+  const history = await rpc("thread/turns/list", {
+    threadId: busy,
+    limit: 100,
+    itemsView: "notLoaded",
+  });
+  assert.equal(history.data.length, 3, "initial, busy, and one combined turn");
+});
+slowGate = new Promise((r) => {
+  releaseSlow = r;
+});
+// Resume the UI solely to initiate another turn, then detach again.
+await rpc("thread/resume", { threadId: busy, excludeTurns: true });
+await rpc("turn/start", {
+  threadId: busy,
+  input: [{ type: "text", text: "SLOW stop check" }],
+});
+await until("stop request", () => requestWith("SLOW stop check"), 10000);
+await rpc("thread/unsubscribe", { threadId: busy });
+const pendingMarker = `SMOKE-STOP-${randomUUID()}`;
+await comment(pendingMarker);
+await sleep(1500);
 busyWatch.kill("SIGTERM");
-
-say(failures.length === 0 ? "PASS" : `FAILED: ${failures.join("; ")}`);
-if (options.keep) say(`scratch kept at ${scratch}`);
-process.exit(failures.length === 0 ? 0 : 1);
+await until(
+  "busy watcher exit",
+  () => busyWatch.exitCode !== null || busyWatch.signalCode !== null,
+  10000,
+);
+await check(
+  "stopping while busy prints pending changes without queueing",
+  async () => {
+    assert.equal(admitted(pendingMarker), false);
+    assert.ok(busyWatch.output.stdout.includes(pendingMarker));
+    assert.ok(busyWatch.output.stdout.includes("since:"));
+  },
+);
+releaseSlow();
+app.close();
+say(
+  failures.length
+    ? `${failures.length} failed checks`
+    : "All Codex follow checks passed",
+);
+process.exit(failures.length ? 1 : 0);

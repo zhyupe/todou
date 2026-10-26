@@ -570,6 +570,7 @@ export class WatchCommand extends ProjectCommand {
 
       const follow = await openFollow<ActivityItem>({
         transport: opts.transport,
+        debounceSec,
         label: `todou watch -p ${project}`,
         subject: project,
         following: project,
@@ -593,7 +594,7 @@ export class WatchCommand extends ProjectCommand {
           ...mode,
           timeoutSec,
           intervalSec,
-          debounceSec,
+          debounceSec: opts.transport === "codex" ? 0 : debounceSec,
           baseline,
           retry,
           clock: this.clock,
@@ -731,6 +732,7 @@ export class WatchCommand extends ProjectCommand {
 
     const follow = await openFollow<CrossActivityItem>({
       transport: opts.transport,
+      debounceSec,
       label: `todou watch ${projects === undefined ? "--all-projects" : `-p ${projects}`}`,
       // The slug list is already de-duplicated, and joining it whole rather
       // than truncating keeps six watched projects merely long-named.
@@ -756,7 +758,7 @@ export class WatchCommand extends ProjectCommand {
         ...mode,
         timeoutSec,
         intervalSec,
-        debounceSec,
+        debounceSec: opts.transport === "codex" ? 0 : debounceSec,
         baseline,
         retry,
         clock: this.clock,

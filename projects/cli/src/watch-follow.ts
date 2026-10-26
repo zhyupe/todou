@@ -1,6 +1,7 @@
 import { Option } from "clipanion";
 import type { Clock } from "./clock.ts";
 import { type CodexTarget, openCodex, type QueueRunner } from "./codex-push.ts";
+import type { openCodexSession } from "./codex-session.ts";
 import { CliError } from "./errors.ts";
 import type { makePainter } from "./format.ts";
 import { detectPermissionMode } from "./harness/claude-code.ts";
@@ -148,7 +149,7 @@ export function followTransport(opts: {
   if (transport === "codex" && !opts.codex) {
     throw new CliError(
       "no Codex thread with a way to deliver into it",
-      "--follow=codex requires CODEX_THREAD_ID plus a `codex` executable on PATH (or TODOU_CODEX_BIN) for `codex queue`; use --poll otherwise",
+      "--follow=codex requires CODEX_THREAD_ID plus a `codex` executable and a daemon control socket (TODOU_CODEX_SOCKET) for state-aware delivery; use --poll otherwise",
     );
   }
   return transport;
@@ -304,6 +305,8 @@ export async function openFollow<T>(opts: {
   open?: typeof openPeerPush;
   /** Test seam; production runs the real `codex queue`. */
   runCodexQueue?: QueueRunner;
+  openCodexSession?: typeof openCodexSession;
+  debounceSec?: number;
 }): Promise<Follow<T>> {
   const stop = opts.transport === "codex" ? new AbortController() : undefined;
   const signal = stop
@@ -313,7 +316,7 @@ export async function openFollow<T>(opts: {
     : opts.signal;
   /** Newest position the loop has reported, for the exit flush. */
   let seenCursor = opts.baseline;
-  /** Where the next batch's range starts: the last delivered cursor. */
+  /** Where the next collected batch starts; the push retains unconfirmed ranges. */
   let rangeStart = opts.baseline;
   const oneShot: Follow<T> = {
     signal,
@@ -349,15 +352,18 @@ export async function openFollow<T>(opts: {
   let opened: PeerPush<T> | null = null;
   if (opts.transport === "codex") {
     if (!opts.messaging.codex) throw new CliError("missing Codex target");
-    // Queue owns next-turn scheduling even when the App has an active turn.
     opened = await openCodex<T>({
       target: opts.messaging.codex,
       signal,
       run: opts.runCodexQueue,
+      openSession: opts.openCodexSession,
+      debounceSec: opts.debounceSec,
+      clock: opts.clock,
+      note: opts.note,
       render: pushBody,
     });
     opts.note(
-      `--follow=codex following ${opts.following} in thread ${opts.messaging.codex.threadId} via codex queue`,
+      `--follow=codex following ${opts.following} in thread ${opts.messaging.codex.threadId} via codex queue; coalescing changes until idle`,
     );
   }
   if (opts.transport === "uds") {
@@ -456,6 +462,10 @@ export async function openFollow<T>(opts: {
       for (const signal of signals) process.off(signal, onSignal);
       if (push === null) return;
       const held = push.unconfirmed();
+      if (held.summaryOnly)
+        opts.note(
+          "Pending tracker batch was summarized; re-read all changes from the printed since cursor through cursor",
+        );
       // The one moment uds mode writes to stdout. Whatever ended the
       // watch — a refusal, a fatal error — the background task's own
       // completion notice carries this over, which is the behaviour from

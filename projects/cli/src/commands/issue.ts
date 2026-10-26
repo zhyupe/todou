@@ -1347,6 +1347,7 @@ export class IssueWatchCommand extends ProjectCommand {
     try {
       const follow = await openFollow<TimelineItem>({
         transport,
+        debounceSec,
         // The header is there to be re-run by hand, and that form names no
         // project and needs quoting to survive a shell.
         label: `todou issue watch ${issueRef}`,
@@ -1374,7 +1375,7 @@ export class IssueWatchCommand extends ProjectCommand {
           ...mode,
           timeoutSec,
           intervalSec,
-          debounceSec,
+          debounceSec: transport === "codex" ? 0 : debounceSec,
           baseline,
           retry,
           clock: this.clock,

@@ -14,6 +14,7 @@ import {
   openCodexQueuePush,
   type QueueRunner,
 } from "../src/codex-push.ts";
+import type { CodexSession } from "../src/codex-session.ts";
 import { followAdvice } from "../src/follow-advice.ts";
 import { harnessMessaging } from "../src/harness/messaging.ts";
 import { followTransport, openFollow } from "../src/watch-follow.ts";
@@ -25,6 +26,15 @@ import {
   sseStub,
   virtualClock,
 } from "./harness.ts";
+import { codexPeer } from "./helpers/codex-peer.ts";
+
+const idleSession = async (): Promise<CodexSession> => ({
+  snapshot: () => ({ status: "idle", queuedIds: [] }),
+  refresh: async () => ({ status: "idle", queuedIds: [] }),
+  rejected: null,
+  whenRejected: new Promise(() => {}),
+  close() {},
+});
 
 const THREAD = "01900000-0000-7000-8000-000000000001";
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -34,13 +44,14 @@ afterEach(async () => {
 
 describe("Codex watch delivery", () => {
   it("flushes a batch still being debounced before re-raising SIGTERM", async () => {
-    const { bin, calls: requests } = codexOnPath();
-    const target = { threadId: THREAD, bin };
+    const { bin, calls: requests, socket } = await codexOnPath();
+    const target = { threadId: THREAD, bin, socket };
     const clock = virtualClock();
     const emitted: unknown[] = [];
     const item = { created_at: clock.iso() };
     const follow = await openFollow<typeof item>({
       transport: "codex",
+      openCodexSession: idleSession,
       label: "watch",
       subject: "todou",
       following: "todou",
@@ -90,8 +101,8 @@ describe("Codex watch delivery", () => {
   it.each(["project", "issue"])(
     "wires the %s watch to Codex and preserves the self filter",
     async (scope) => {
-      const { bin, calls: requests } = codexOnPath();
-      const target = { threadId: THREAD, bin };
+      const { bin, calls: requests, socket } = await codexOnPath();
+      const target = { threadId: THREAD, bin, socket };
       const clock = virtualClock();
       const sse = sseStub();
       let page = 0;
@@ -107,11 +118,12 @@ describe("Codex watch delivery", () => {
           endpoint,
           () => {
             page++;
-            if (page > 2)
+            if (page > 2) {
               return {
                 __status: 404,
                 body: { code: "not_found", message: "gone" },
               };
+            }
             return {
               items:
                 page === 1
@@ -149,12 +161,18 @@ describe("Codex watch delivery", () => {
           "0",
         ],
         {
-          fetchImpl,
+          fetchImpl: async (input, init) => {
+            if (String(input).includes(endpoint) && page >= 2) {
+              await vi.waitFor(() => expect(requests()).toHaveLength(1));
+            }
+            return fetchImpl(input, init);
+          },
           clock,
           env: {
             ...loggedInEnv("todou"),
             CODEX_THREAD_ID: THREAD,
             TODOU_CODEX_BIN: target.bin,
+            TODOU_CODEX_SOCKET: socket,
           },
         },
       );
@@ -171,13 +189,14 @@ describe("Codex watch delivery", () => {
   );
 
   it("flushes undelivered events and cursor through the shared follow contract", async () => {
-    const { bin } = codexOnPath();
-    const target = { threadId: THREAD, bin };
+    const { bin, socket } = await codexOnPath();
+    const target = { threadId: THREAD, bin, socket };
     const emitted: unknown[] = [];
     const notes: string[] = [];
     const before = process.listenerCount("SIGTERM");
     const follow = await openFollow<string>({
       transport: "codex",
+      openCodexSession: idleSession,
       label: "todou issue watch 3",
       subject: "3",
       following: "T-3",
@@ -196,7 +215,8 @@ describe("Codex watch delivery", () => {
     });
     cleanups.push(follow.finish);
     expect(follow.silent).toBe(true);
-    expect(await follow.afterItems?.(["answer"], "c1")).toBe("stop");
+    expect(await follow.afterItems?.(["answer"], "c1")).toBe("continue");
+    await vi.waitFor(() => expect(follow.shouldStop?.()).toBe(true));
     follow.finish();
     follow.finish();
     expect(emitted).toEqual([{ items: ["answer"], since: "c0", cursor: "c1" }]);
@@ -209,6 +229,7 @@ describe("Codex watch delivery", () => {
     const stop = new AbortController();
     const follow = await openFollow<string>({
       transport: "codex",
+      openCodexSession: idleSession,
       label: "watch",
       subject: "todou",
       following: "todou",
@@ -218,7 +239,13 @@ describe("Codex watch delivery", () => {
       wait: () => new Promise<void>(() => {}),
       render,
       emit: () => {},
-      messaging: { codex: { threadId: THREAD, bin: "/opt/codex" } },
+      messaging: {
+        codex: {
+          threadId: THREAD,
+          bin: "/opt/codex",
+          socket: "/test/control.sock",
+        },
+      },
       session: () => THREAD,
       clock: virtualClock(),
       note: () => {},
@@ -230,11 +257,18 @@ describe("Codex watch delivery", () => {
     expect(follow.shouldStop?.()).toBe(true);
   });
 
-  it("requires an executable and explicit thread; never borrows Claude or socket-only delivery", () => {
-    const { bin } = codexOnPath();
-    const env = { CODEX_THREAD_ID: THREAD, TODOU_CODEX_BIN: bin };
-    const target = { threadId: THREAD, bin };
+  it("requires an executable and explicit thread; never borrows Claude or socket-only delivery", async () => {
+    const { bin, socket } = await codexOnPath();
+    const env = {
+      CODEX_THREAD_ID: THREAD,
+      TODOU_CODEX_BIN: bin,
+      TODOU_CODEX_SOCKET: socket,
+    };
+    const target = { threadId: THREAD, bin, socket };
     expect(codexTarget(env)).toEqual(target);
+    expect(
+      codexTarget({ ...env, TODOU_CODEX_SOCKET: "/missing/control.sock" }),
+    ).toBeUndefined();
     expect(
       harnessMessaging({ ...env, CLAUDE_CODE_MESSAGING_SOCKET: "/wrong.sock" }),
     ).toEqual({ codex: target });
@@ -271,7 +305,8 @@ describe("Codex watch delivery", () => {
 });
 
 /** A directory holding an executable `codex`, for PATH lookups. */
-function codexOnPath() {
+async function codexOnPath() {
+  const { socket } = await codexPeer();
   const dir = mkdtempSync(join(tmpdir(), "todou-codex-bin-"));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   const bin = join(dir, "codex");
@@ -289,6 +324,7 @@ console.log('Queued message test-batch for thread ${THREAD}.');
   return {
     dir,
     bin,
+    socket,
     calls: (): string[][] =>
       readFileSync(log, "utf8")
         .trim()
@@ -313,39 +349,42 @@ const render = (items: string[], since?: string, cursor?: string) =>
   `${items.join("\n")}\nsince: ${since}\ncursor: ${cursor}`;
 
 describe("Codex queue transport", () => {
-  it("finds codex on PATH, skipping relative and non-executable entries", () => {
-    const { dir, bin } = codexOnPath();
+  it("finds codex on PATH, skipping relative and non-executable entries", async () => {
+    const { dir, bin, socket } = await codexOnPath();
     const plain = mkdtempSync(join(tmpdir(), "todou-codex-plain-"));
     cleanups.push(() => rmSync(plain, { recursive: true, force: true }));
     writeFileSync(join(plain, "codex"), "not executable");
     const env = {
       CODEX_THREAD_ID: THREAD,
       HOME: "/nonexistent-todou-home",
+      TODOU_CODEX_SOCKET: socket,
       PATH: ["relative", plain, dir].join(":"),
     };
-    expect(codexTarget(env)).toEqual({ threadId: THREAD, bin });
+    expect(codexTarget(env)).toEqual({ threadId: THREAD, bin, socket });
     expect(codexTarget({ ...env, PATH: plain })).toBeUndefined();
     expect(codexTarget({ ...env, PATH: "relative" })).toBeUndefined();
     expect(codexTarget({ ...env, PATH: "", TODOU_CODEX_BIN: bin })).toEqual({
       threadId: THREAD,
       bin,
+      socket,
     });
     expect(codexTarget({ ...env, TODOU_CODEX_BIN: "codex" })).toBeUndefined();
     expect(codexTarget({ ...env, CODEX_THREAD_ID: "../t" })).toBeUndefined();
   });
 
   it("uses the queue even when an App socket is configured", async () => {
-    const { bin } = codexOnPath();
+    const { bin, socket } = await codexOnPath();
     const target = codexTarget({
       CODEX_THREAD_ID: THREAD,
-      TODOU_CODEX_SOCKET: "/run/control.sock",
+      TODOU_CODEX_SOCKET: socket,
       TODOU_CODEX_BIN: bin,
     });
-    expect(target).toEqual({ threadId: THREAD, bin });
+    expect(target).toEqual({ threadId: THREAD, bin, socket });
     const { calls, run } = queueRunner(() => QUEUED);
     const push = await openCodex({ target: target!, render, run });
+    cleanups.push(push.close);
     await push.send(["next card"], "c0", "c1");
-    expect(calls).toHaveLength(1);
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
     expect(calls[0]?.[1]).toBe("queue");
   });
 
@@ -467,6 +506,7 @@ describe("Codex queue transport", () => {
     const notes: string[] = [];
     const follow = await openFollow<string>({
       transport: "codex",
+      openCodexSession: idleSession,
       label: "todou issue watch 3",
       subject: "3",
       following: "T-3",
@@ -475,7 +515,13 @@ describe("Codex queue transport", () => {
       wait: undefined,
       render: (items) => items.join("\n"),
       emit: () => {},
-      messaging: { codex: { threadId: THREAD, bin: "/opt/codex" } },
+      messaging: {
+        codex: {
+          threadId: THREAD,
+          bin: "/opt/codex",
+          socket: "/test/control.sock",
+        },
+      },
       session: () => THREAD,
       clock: virtualClock(),
       note: (line) => notes.push(line),
@@ -484,7 +530,7 @@ describe("Codex queue transport", () => {
     cleanups.push(follow.finish);
     expect(follow.silent).toBe(true);
     expect(await follow.afterItems?.(["answer"], "c1")).toBe("continue");
-    expect(calls).toHaveLength(1);
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
     expect(notes.join("\n")).toContain("via codex queue");
   });
 
@@ -506,6 +552,7 @@ describe("Codex queue transport", () => {
       const { calls, run } = queueRunner(() => QUEUED);
       const follow = await openFollow<string>({
         transport: "codex",
+        openCodexSession: idleSession,
         label: "todou issue watch 3",
         subject: "3",
         following: "T-3",
@@ -514,7 +561,13 @@ describe("Codex queue transport", () => {
         wait: undefined,
         render: (items) => items.join("\n"),
         emit: () => {},
-        messaging: { codex: { threadId: THREAD, bin: "/opt/codex" } },
+        messaging: {
+          codex: {
+            threadId: THREAD,
+            bin: "/opt/codex",
+            socket: "/test/control.sock",
+          },
+        },
         frame,
         session: () => THREAD,
         clock: virtualClock(),
@@ -523,14 +576,15 @@ describe("Codex queue transport", () => {
       });
       cleanups.push(follow.finish);
       await follow.afterItems?.(["answer"], "c1");
+      await vi.waitFor(() => expect(calls).toHaveLength(1));
       expect(calls[0]?.[5]).toBe(message);
     },
   );
 
-  it("advises the queue where there is no socket, and poll where there is neither", async () => {
-    const { dir } = codexOnPath();
+  it("advises coalescing with a socket, and polling without the required tools", async () => {
+    const { dir, socket } = await codexOnPath();
     const queued = await runCli(["agent", "can-i-follow"], {
-      env: { CODEX_THREAD_ID: THREAD, PATH: dir },
+      env: { CODEX_THREAD_ID: THREAD, PATH: dir, TODOU_CODEX_SOCKET: socket },
     });
     expect(queued.exitCode).toBe(0);
     expect(queued.stdout).toContain("`codex queue`");
@@ -538,7 +592,11 @@ describe("Codex queue transport", () => {
     expect(
       followAdvice({
         harness: "codex",
-        codex: { threadId: THREAD, bin: "/opt/codex" },
+        codex: {
+          threadId: THREAD,
+          bin: "/opt/codex",
+          socket: "/test/control.sock",
+        },
         socket: undefined,
         optedOut: false,
       }).situation,

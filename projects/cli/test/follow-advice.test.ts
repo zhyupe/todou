@@ -41,6 +41,7 @@ describe("followAdvice", () => {
     const codex = {
       bin: "/opt/codex",
       threadId: "thread-test",
+      socket: "/test/control.sock",
     };
     expect(
       followAdvice({

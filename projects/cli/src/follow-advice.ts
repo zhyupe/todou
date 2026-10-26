@@ -206,15 +206,15 @@ export function followAdvice(input: {
   });
 
   if (harness === "codex") {
-    if (input.codex?.bin !== undefined) {
+    if (input.codex?.bin !== undefined && input.codex.socket !== undefined) {
       return advice("codex-queue", [
-        "running under Codex, so `--follow=codex` hands each batch to `codex queue`: it starts a new turn when this conversation is idle, and otherwise waits for the running turn to end.",
+        "running under Codex, so `--follow=codex` subscribes to this loaded thread and collects changes locally while it runs. Once idle with an empty queue, it submits one combined batch via `codex queue`.",
         ...CODEX_START,
         CLOSING,
       ]);
     }
     return advice("codex-no-peer", [
-      "running under Codex, but no `codex` executable is available on PATH or at an absolute TODOU_CODEX_BIN path, so nothing can deliver into this conversation.",
+      "running under Codex, but a `codex` executable and daemon control socket are both required to observe this thread before delivery. Set TODOU_CODEX_BIN and TODOU_CODEX_SOCKET when automatic discovery is unavailable.",
       "A background command's output does not wake Codex, so `--follow=stdout` cannot help here: use poll mode. Either watch, run without `--follow`, blocks, returns one batch and exits; re-open it from the cursor it printed. `--poll` checks once without blocking.",
       CLOSING,
     ]);

@@ -85,6 +85,8 @@ function bounceTarget(from: unknown, self: string): string | null {
 
 /** One push's worth of entries and the cursor range they cover. */
 type Batch<T> = {
+  /** Large Codex batches retain their range instead of every event body. */
+  summaryOnly?: boolean;
   items: T[];
   since: string | undefined;
   cursor: string | undefined;
@@ -92,8 +94,8 @@ type Batch<T> = {
 
 export type PeerPush<T> = {
   /**
-   * Renders and writes one push, then returns — it does not wait out the
-   * receipt window. `since` is where this batch starts, `cursor` where it
+   * Accepts one batch; Codex may hold it locally until idle. `since` is
+   * where this batch starts, `cursor` where it
    * ends; a batch merged with earlier unsent ones keeps the oldest `since`,
    * so the range still abuts the last successful push. Never throws: a
    * failed write leaves the batch queued and shows up in `rejected` or in
